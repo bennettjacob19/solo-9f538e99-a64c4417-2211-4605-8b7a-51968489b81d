@@ -11,6 +11,12 @@ the key interleavings:
   D. a late (delayed) old answer cannot resurrect anything
   E. resolver restart does not extend the old A's validity
   F. web console smoke test (page, mode switch, query, state)
+  G. delay mode snapshots address/delay at receive time; edits while a
+     request is waiting never change the in-flight request, which answers
+     exactly once, measured from its own receive moment
+  H. field-level optimistic concurrency on the console (partial applies,
+     two pages on different fields, whole-tx rejection on conflict) and the
+     legacy /api/mode compatibility contract
 
 Exits non-zero if any check fails.  Runtime: ~95s.
 """
@@ -18,10 +24,12 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -130,6 +138,50 @@ def dns_query() -> tuple[int, list[tuple], str | None]:
             if txt.startswith("source="):
                 src = txt.split("=", 1)[1].split()[0]
     return rep.header.rcode, answers, src
+
+
+def auth_query(timeout: float = 6.0) -> tuple[float, str | None]:
+    """Query the authoritative endpoint directly.
+
+    Returns (elapsed_seconds, answered_ip).  A dedicated socket means a late
+    datagram cannot be mistaken for this request's answer.
+    """
+    q = DNSRecord.question(DOMAIN, "A")
+    t0 = time.time()
+    data = q.send("127.0.0.1", AUTH_PORT, timeout=timeout)
+    rep = DNSRecord.parse(data)
+    ip = str(rep.rr[0].rdata) if rep.rr else None
+    return time.time() - t0, ip
+
+
+def count_auth_replies(wait: float) -> int:
+    """Send one auth query and count every datagram received within wait."""
+    q = DNSRecord.question(DOMAIN, "A")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.2)
+    sock.sendto(q.pack(), ("127.0.0.1", AUTH_PORT))
+    n = 0
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            sock.recvfrom(4096)
+            n += 1
+        except socket.timeout:
+            pass
+    sock.close()
+    return n
+
+
+def http_post(path: str, body: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{WEB_PORT}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
 
 
 def check(name: str, cond: bool, info: str = "") -> None:
@@ -331,6 +383,99 @@ def main() -> int:
             check("F5 非法模式被拒绝", False)
         except urllib.error.HTTPError as e:
             check("F5 非法模式被拒绝", e.code == 400)
+
+        # -- G. delay snapshot at receive; in-flight edits have no effect ----
+        print("G. 延迟应答在收包时快照地址与延迟；等待中改配置不影响在途请求",
+              flush=True)
+        clear_cache()
+        set_mode("delay", "192.0.2.70", 3.0)
+        result = {}
+
+        def g_worker():
+            result["elapsed"], result["ip"] = auth_query(timeout=8)
+
+        th = threading.Thread(target=g_worker)
+        th.start()
+        time.sleep(0.4)  # the auth side has received the packet and is waiting
+        # while the request is still in flight: shorten the delay and change
+        # the address.  The committed request must ignore both edits.
+        set_mode("delay", "192.0.2.71", 0.5)
+        th.join()
+        check("G1 在途请求沿用提交时的 3s 延迟",
+              2.8 <= result["elapsed"] <= 3.4, f"耗时={result['elapsed']:.2f}s")
+        check("G2 在途请求仍答提交时的旧地址", result["ip"] == "192.0.2.70",
+              f"ip={result['ip']}")
+        # a subsequently received packet uses the newly committed values,
+        # with the 0.5s measured from its own receive time
+        el, ip = auth_query(timeout=5)
+        check("G3 新请求按新延迟 0.5s（从收包时刻起算）", 0.4 <= el <= 1.0,
+              f"耗时={el:.2f}s")
+        check("G4 新请求返回新地址", ip == "192.0.2.71", f"ip={ip}")
+        n = count_auth_replies(wait=4.0)
+        check("G5 到点只答一次", n == 1, f"收到应答数={n}")
+        # the resolver's cache/timeout rules are untouched: a 3s delayed
+        # upstream answer still exceeds the 2s upstream timeout
+        set_mode("a", "192.0.2.72")
+        rc, ans, src = dns_query()
+        assert rc == 0 and src == "upstream", f"setup failed: {rc} {src}"
+        set_mode("delay", "192.0.2.73", 3.0)
+        time.sleep(5.5)  # fresh A expires
+        t0 = time.time()
+        rc, ans, src = dns_query()  # upstream timeout 2s; delayed answer lands late
+        check("G6 解析器仍按原回源超时规则给 stale",
+              rc == 0 and src == "cache-stale"
+              and 1.8 <= time.time() - t0 <= 4, f"src={src} 耗时={time.time()-t0:.1f}s")
+
+        # -- H. field-level optimistic concurrency + legacy compatibility ----
+        print("H. 字段级乐观锁：局部应用/不同页分别生效/冲突整次拒绝", flush=True)
+        set_mode("a", "192.0.2.80", 3.0)
+        # two pages editing different fields both commit
+        code, r = http_post("/api/control/apply", {
+            "changes": {"delay_seconds": 0.5},
+            "expected": {"delay_seconds": 3.0}})
+        check("H1 只提交本页改动（延迟），其余项保留",
+              code == 200 and r["ok"] and r["control"]["delay_seconds"] == 0.5
+              and r["control"]["mode"] == "a"
+              and r["control"]["ip"] == "192.0.2.80", str(r))
+        code, r = http_post("/api/control/apply", {
+            "changes": {"mode": "delay"}, "expected": {"mode": "a"}})
+        check("H2 另一页改模式同样生效", code == 200 and r["ok"]
+              and r["control"]["mode"] == "delay"
+              and r["control"]["delay_seconds"] == 0.5, str(r))
+        # conflict: effective 0.5 differs from both stale baseline 3.0 and
+        # this page's proposal 9.0 -> whole transaction rejected, nothing written
+        code, r = http_post("/api/control/apply", {
+            "changes": {"delay_seconds": 9.0},
+            "expected": {"delay_seconds": 3.0}})
+        check("H3 冲突整次拒绝并回显冲突项生效值",
+              code == 409 and not r["ok"] and r["error"] == "conflict"
+              and r["conflicts"] == {"delay_seconds": 0.5}
+              and r["control"]["delay_seconds"] == 0.5, str(r))
+        # one conflicting field rejects the whole multi-field submission
+        before = common_get_control()
+        code, r = http_post("/api/control/apply", {
+            "changes": {"mode": "timeout", "ip": "10.9.9.9"},
+            "expected": {"mode": "nxdomain", "ip": "192.0.2.80"}})
+        check("H4 多字段中一项冲突则全部不写入",
+              code == 409 and list(r["conflicts"]) == ["mode"]
+              and common_get_control() == before, str(r))
+        # convergence: proposal equal to the new effective value is accepted
+        code, r = http_post("/api/control/apply", {
+            "changes": {"delay_seconds": 0.5},
+            "expected": {"delay_seconds": 3.0}})
+        check("H5 拟存值与生效值一致时不算冲突", code == 200 and r["ok"], str(r))
+        # legacy endpoint: missing fields filled at submit time; full config back
+        code, r = http_post("/api/mode", {"mode": "a"})
+        check("H6 旧 /api/mode 缺省项按生效值补齐并返回完整配置",
+              code == 200 and r["ok"] and r["control"]["mode"] == "a"
+              and r["control"]["ip"] == "192.0.2.80"
+              and r["control"]["delay_seconds"] == 0.5
+              and {"id", "mode", "ip", "delay_seconds", "updated_at"}
+              <= set(r["control"]), str(r))
+        code, r = http_post("/api/control/apply", {
+            "changes": {"ip": "not-an-ip"},
+            "expected": {"ip": "192.0.2.80"}})
+        check("H7 新接口非法值被拒绝", code == 400 and not r["ok"], str(r))
     finally:
         for name in list(procs):
             stop(name)
@@ -346,6 +491,14 @@ def get_control_mode() -> str:
     mode = conn.execute("SELECT mode FROM control WHERE id = 1").fetchone()[0]
     conn.close()
     return mode
+
+
+def common_get_control() -> dict:
+    conn = sqlite3.connect(DB, timeout=15)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM control WHERE id = 1").fetchone()
+    conn.close()
+    return dict(row)
 
 
 if __name__ == "__main__":

@@ -111,6 +111,65 @@ def set_control(mode: str, ip: str, delay_seconds: float) -> None:
         )
 
 
+class ControlConflict(Exception):
+    """Optimistic-lock failure: another page committed a field after this edit
+    started, and this submission neither knew about nor matches that value."""
+
+    def __init__(self, conflicts: dict):
+        super().__init__(f"control conflict: {conflicts}")
+        self.conflicts = conflicts
+
+
+def apply_control_change(changes: dict, expected: dict) -> dict:
+    """Merge a single page's partial edit into the control row.
+
+    ``changes`` maps a subset of ('mode', 'ip', 'delay_seconds') to the values
+    this page wants to save; every other field keeps the currently effective
+    value.  ``expected`` maps the same subset to the values that were effective
+    when this page started editing each field (the optimistic-lock baseline).
+
+    A field conflicts -- and the whole transaction is rejected with no write --
+    when its current effective value differs from BOTH the baseline the page
+    edited against AND the value this page proposes.  A current value that
+    equals the baseline (nobody else changed it) or equals the proposal (the
+    two pages converged) is not a conflict.
+    """
+    fields = ("mode", "ip", "delay_seconds")
+    with _connect() as c:
+        cur = c.execute("SELECT * FROM control WHERE id = 1").fetchone()
+        if cur is None:
+            cur = {"mode": "a", "ip": DEFAULT_IP, "delay_seconds": DEFAULT_DELAY}
+        else:
+            cur = dict(cur)
+
+        conflicts: dict = {}
+        for f in fields:
+            if f not in changes:
+                continue
+            new_val = float(changes[f]) if f == "delay_seconds" else changes[f]
+            base_val = expected.get(f)
+            if base_val is not None and f == "delay_seconds":
+                base_val = float(base_val)
+            cur_val = float(cur[f]) if f == "delay_seconds" else cur[f]
+            if base_val is not None and cur_val != base_val and cur_val != new_val:
+                conflicts[f] = cur_val
+        if conflicts:
+            raise ControlConflict(conflicts)
+
+        merged = {f: cur[f] for f in fields}
+        for f in fields:
+            if f in changes:
+                merged[f] = float(changes[f]) if f == "delay_seconds" else changes[f]
+        c.execute(
+            "UPDATE control SET mode = ?, ip = ?, delay_seconds = ?, updated_at = ?"
+            " WHERE id = 1",
+            (merged["mode"], merged["ip"], float(merged["delay_seconds"]),
+             time.time()),
+        )
+        row = c.execute("SELECT * FROM control WHERE id = 1").fetchone()
+        return dict(row)
+
+
 # --------------------------------------------------------------------------
 # cache table (resolver only)
 # --------------------------------------------------------------------------

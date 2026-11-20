@@ -31,7 +31,7 @@ DB_PATH=/tmp/dns/app.db RESOLVER_PORT=15353 AUTH_PORT=15354 python -m app.resolv
 DB_PATH=/tmp/dns/app.db RESOLVER_PORT=15353 WEB_PORT=8000 python -m app.web &
 ```
 
-自测（自动拉起三进程，跑全部关键交错，约 95 秒）：
+自测（自动拉起三进程，跑全部关键交错，约 110 秒）：
 
 ```bash
 python tests/selftest.py
@@ -51,7 +51,29 @@ python tests/selftest.py
 
 网页可切换权威端行为：`a`（可改 IP）/ `nxdomain` / `delay`（延迟应答，默认 3s，
 大于上游超时，用于演练迟到应答）/ `timeout`（不应答，模拟权威端失联）。
-网页"发起查询"经解析器发真实 DNS 查询，展示实际答复（rcode、应答、TTL）
+
+**延迟模式的收包快照语义**：权威端对每个收到的查询包只读取一次 `control` 表，
+把当时已提交的模式/地址/延迟整体快照给该请求。延迟从**该请求在权威端的收包时刻**
+起算，到点**只应答一次**；等待期间在网页上改地址或延迟，不影响仍在等待的在途请求
+（它仍按提交时的旧地址、旧延迟应答），新配置只对之后收到的包生效。
+权威端日志以 `delayed`（收包快照）+ `answered`（到点单次应答）成对记录每次延迟应答。
+
+**网页表单的字段级乐观锁**：每 2 秒自动刷新只更新“生效值”，不会覆盖本页未保存的
+草稿（草稿有标记并保留）；点「应用」只提交本页改动过的字段，每个字段附带开始编辑时
+的生效值作为基线。两页改不同字段时互不冲突、分别生效；若某字段当前生效值同时不同于
+开始编辑时的基线值和本页拟保存的值，则**整次提交拒绝**（HTTP 409，不写入任何字段），
+页面列出冲突项的生效值并保留全部草稿，核对后可直接重提。拟保存值恰好等于新生效值
+（两页收敛）时不算冲突。
+
+- 新接口 `POST /api/control/apply`，请求体 `{"changes": {字段: 新值},
+  "expected": {字段: 基线值}}`，字段限 `mode` / `ip` / `delay_seconds`；
+  成功返回 `{"ok": true, "control": <本次保存的完整配置>}`，
+  冲突返回 `{"ok": false, "error": "conflict", "conflicts": {字段: 生效值},
+  "control": <当前完整配置>}`。
+- 旧 `POST /api/mode` 保持可用：缺省的 `ip` / `delay_seconds` 按**提交时**的生效值
+  补齐，成功响应同样返回本次保存的完整配置。
+
+网页“发起查询”经解析器发真实 DNS 查询，展示实际答复（rcode、应答、TTL）
 与来源（`upstream` / `cache-fresh` / `cache-stale` / `none`，由解析器在
 additional 段 TXT `_src.<域名>` 中带回），并展示双方日志。
 
@@ -65,6 +87,6 @@ app/common.py       配置 + SQLite 状态面
 app/auth_server.py  可控权威端（dnslib 编解码，线程并发）
 app/resolver.py     缓存/serve-stale 解析器
 app/web.py          FastAPI 操作网页
-tests/selftest.py   端到端自测（A–F 六组场景）
+tests/selftest.py   端到端自测（A–H 八组场景）
 Dockerfile / docker-compose.yml / requirements.txt
 ```
